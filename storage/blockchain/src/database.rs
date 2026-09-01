@@ -445,9 +445,9 @@ impl BlockchainDatabase {
         reset_fjall_keyspace(&self.fjall, &self.alt_transaction_blobs)?;
         reset_fjall_keyspace(&self.fjall, &self.alt_transaction_infos)?;
 
-        if let Some(prunable_tip) = self.prunable_tip.take() {
-            self.fjall.delete_keyspace(prunable_tip)?;
-        }
+        // It is taken out of `self` for the duration of the replay rather than deleted,
+        // because leaving it in place would overwrite every V2 entry with the empty prunable blob the rebuild feeds it.
+        let prunable_tip = self.prunable_tip.take();
 
         let rebuild_span = tracing::info_span!("rebuild_fjall_database");
         let _guard = rebuild_span.enter();
@@ -503,6 +503,8 @@ impl BlockchainDatabase {
         }
 
         batch.commit()?;
+
+        self.prunable_tip = prunable_tip;
 
         Ok(())
     }
