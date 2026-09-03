@@ -418,9 +418,14 @@ impl BlockchainDatabase {
             self.rebuild_fjall_database()?;
         }
 
-        // If we are pruning and don't have the `prunable_tip` table then enable pruning.
-        if (self.config.prune || self.pruning_seed != PruningSeed::NotPruned)
-            && self.prunable_tip.is_none()
+        // Two cases need `enable_pruning`:
+        // - Pruning was requested *and* no seed is committed yet, so activate it
+        // - We are pruned *but* `prunable_tip` is gone, so fail loudly
+        //
+        // The first case doesn't test `prunable_tip` because a crash mid-activation could leave a half-filled one behind, and skipping on that would leave the node unpruned.
+        // Resuming over a half-filled `prunable_tip` would be safe because no seed means no tape was deleted yet, so we rewrite its entries from the same tapes
+        if (self.config.prune && self.pruning_seed == PruningSeed::NotPruned)
+            || (self.pruning_seed != PruningSeed::NotPruned && self.prunable_tip.is_none())
         {
             self.enable_pruning()?;
         }
@@ -515,29 +520,42 @@ impl BlockchainDatabase {
         self.pruning_seed
     }
 
-    /// - generate new [`PruningSeed`] (if one doesn't exist)
-    /// - populate [`BlockchainDatabase::prunable_tip`] with latest blocks
-    /// - delete unnecessary [`BlockchainDatabase::prunable_blobs`]
+    /// Enables pruning by filling [`BlockchainDatabase::prunable_tip`] from all tapes, then delete the 7 we no longer need.
+    ///
+    /// **The order matters!, steps 4 and 5 are destructive**:
+    ///
+    /// 1. Get the [`PruningSeed`] to prune with
+    ///     - In memory only, nothing is written yet
+    ///     - A new one is generated, unless we are already pruned and only lost `prunable_tip`
+    /// 2. Populate `prunable_tip` with the latest blocks
+    /// 3. Persist it to disk
+    ///     - Committing a `fjall` batch is not enough, it can still be lost on a crash
+    /// 4. Commit the [`PruningSeed`]
+    ///     - The point of no return, from here on the node counts as pruned
+    ///     - The next startup deletes the tapes even if we crash before step 5
+    /// 5. Delete the unnecessary [`BlockchainDatabase::prunable_blobs`]
+    ///
+    /// If interrupted before 4, the node is still unpruned with every tape intact and the next startup redoes this, reusing the partial `prunable_tip` (as long as pruning is still requested)
     fn enable_pruning(&mut self) -> Result<(), BlockchainError> {
-        if self.pruning_seed == PruningSeed::NotPruned {
-            let mut tapes_tx = self.linear_tapes.append();
-
+        // Get the seed to prune with (in memory only)
+        // An already pruned node that lost `prunable_tip` re-enters here and keeps its seed
+        let seed = if self.pruning_seed == PruningSeed::NotPruned {
             // generate a random stripe index to prune
             let stripe_idx = rand::thread_rng().gen_range(
                 1..=u32::try_from(PRUNABLE_BLOBS.len())
                     .expect("there shouldn't be that many prunable blobs"),
             );
-            let seed = PruningSeed::new_pruned(stripe_idx, CRYPTONOTE_PRUNING_LOG_STRIPES).unwrap();
-            self.pruning_seed = seed;
-            tapes_tx.append_bytes(&self.tapes_metadata, &seed.compress().to_le_bytes())?;
-            tapes_tx.commit(Persistence::SyncAll)?;
-        }
+            PruningSeed::new_pruned(stripe_idx, CRYPTONOTE_PRUNING_LOG_STRIPES).unwrap()
+        } else {
+            self.pruning_seed
+        };
 
-        tracing::info!(
-            "Pruning chain on stripe = {:?}.",
-            self.pruning_seed.get_stripe().unwrap()
-        );
+        let stripe = seed.get_stripe().unwrap();
 
+        tracing::info!("Pruning chain on stripe = {stripe:?}.");
+
+        // Populate `prunable_tip`
+        // An interrupted run leaves a correct but incomplete keyspace, so reuse it if it is there
         let tapes_reader = self.linear_tapes.reader();
         let mut w = self.fjall.batch();
 
@@ -568,24 +586,20 @@ impl BlockchainDatabase {
             if tx_info.is_v1_tx() {
                 continue;
             }
-            let stripe = cuprate_pruning::get_block_pruning_stripe(
+            let tx_stripe = cuprate_pruning::get_block_pruning_stripe(
                 tx_info.height,
                 usize::MAX,
                 CRYPTONOTE_PRUNING_LOG_STRIPES,
             )
             .unwrap();
 
-            let Some(prunable_blob) = self.prunable_blobs
-                [usize::try_from(stripe).expect("stripe will not exceed usize::MAX") - 1]
+            // Pruning is only enabled while:
+            // "Seed is not committed" *or* "`prunable_tip` did not exist at open".
+            // In both cases every prunable tape was opened.
+            let prunable_blob = self.prunable_blobs
+                [usize::try_from(tx_stripe).expect("stripe will not exceed usize::MAX") - 1]
                 .as_ref()
-            else {
-                self.prunable_tip = Some(prunable_tip);
-                w.commit()?;
-
-                tracing::warn!("We are missing some prunable tip data, top cache will be short.");
-
-                return Ok(());
-            };
+                .expect("every prunable tape is open when enabling pruning");
 
             let mut blob = vec![0; tx_info.prunable_size];
             tapes_reader.read_bytes(prunable_blob, tx_info.prunable_blob_idx, &mut blob)?;
@@ -597,18 +611,31 @@ impl BlockchainDatabase {
                 w = self.fjall.batch();
             }
         }
-        self.prunable_tip = Some(prunable_tip);
         w.commit()?;
+        drop(tapes_reader);
+
+        // Persist `prunable_tip` to disk
+        // Make the tip durable before recording that we are pruned and before deleting the tapes it replaces
+        self.fjall.persist(PersistMode::SyncAll)?;
+
+        // Commit the seed (the point of no return)
+        // Only a seed we just generated needs committing, a re-entry already has one on disk
+        if self.pruning_seed == PruningSeed::NotPruned {
+            let mut tapes_tx = self.linear_tapes.append();
+            tapes_tx.append_bytes(&self.tapes_metadata, &seed.compress().to_le_bytes())?;
+            tapes_tx.commit(Persistence::SyncAll)?;
+        }
+        self.pruning_seed = seed;
+        self.prunable_tip = Some(prunable_tip);
 
         // TODO: make the tapes delete API better so we don't need to reconstruct this.
+        // Delete the tapes we no longer need
         let tapes_blob_dir = self.config.blob_dir.join("tapes");
         let prunable_tape_open_options = TapeOpenOptions {
             top_cache_size: self.config.cache_sizes.prunable_blobs,
             dir: tapes_blob_dir,
         };
 
-        drop(tapes_reader);
-        let stripe = self.pruning_seed.get_stripe().unwrap();
         for (i, prunable_blob) in self.prunable_blobs.iter_mut().enumerate() {
             if u32_to_usize(stripe) - 1 != i {
                 self.linear_tapes
