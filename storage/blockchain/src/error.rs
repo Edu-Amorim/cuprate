@@ -15,4 +15,6 @@ pub enum BlockchainError {
     InvalidMetadata(#[from] bytes::TryGetError),
     #[error("invalid pruning seed")]
     InvalidPruningSeed(#[from] PruningError),
+    #[error("pruned database is missing the prunable tip, the data it held cannot be recovered")]
+    MissingPrunableTip,
 }
