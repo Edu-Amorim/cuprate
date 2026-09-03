@@ -3,12 +3,9 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 use tower::Service;
 
-use cuprate_consensus::{
-    BlockChainContextRequest, BlockChainContextResponse, BlockchainContextService,
-};
+use cuprate_consensus::BlockchainContextService;
 use cuprate_helper::{cast::usize_to_u64, map::split_u128_into_low_high_bits};
 use cuprate_p2p_core::services::{CoreSyncDataRequest, CoreSyncDataResponse};
 use cuprate_pruning::PruningSeed;
@@ -26,7 +23,7 @@ impl Service<CoreSyncDataRequest> for CoreSyncService {
     type Error = tower::BoxError;
     type Future = Ready<Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 

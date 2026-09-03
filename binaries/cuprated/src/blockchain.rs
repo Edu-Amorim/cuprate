@@ -13,8 +13,7 @@ use cuprate_consensus::{
     generate_genesis_block, BlockchainContext, BlockchainContextService, ContextConfig,
 };
 use cuprate_cryptonight::cryptonight_hash_v0;
-use cuprate_p2p::{block_downloader::BlockDownloaderConfig, NetworkInterface};
-use cuprate_p2p_core::{client::PeerSyncCallback, ClearNet, Network};
+use cuprate_p2p_core::{client::PeerSyncCallback, Network};
 use cuprate_types::{
     blockchain::{BlockchainReadRequest, BlockchainWriteRequest},
     VerifiedBlockInformation,
@@ -31,7 +30,6 @@ mod types;
 pub use error::IncomingBlockError;
 pub use fast_sync::get_fast_sync_hashes;
 pub use interface::BlockchainManagerHandle;
-pub use manager::IncomingBlockOk;
 pub use syncer::BlockchainSyncerHandle;
 pub use types::ConsensusBlockchainReadHandle;
 
