@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use arc_swap::ArcSwap;
@@ -21,6 +22,14 @@ use crate::{
 
 /// The key used to store the main-chain tip in [`BlockchainDatabase::chain_tip`].
 pub(crate) const CHAIN_TIP_KEY: &[u8] = b"tip";
+
+/// The amount of times [`BlockchainDatabase::read_transactions`] will retry before giving up.
+///
+/// With [`TIPS_MATCH_RETRY_DELAY`] this waits 60 seconds, the bound only has to outlast a write, a pair that still disagrees after it is not waiting on one.
+const TIPS_MATCH_RETRIES: usize = 6_000;
+
+/// The amount of time [`BlockchainDatabase::read_transactions`] sleeps between retries.
+const TIPS_MATCH_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// Deletes a [`fjall::Keyspace`] and recreates it with the same name.
 fn recreate_fjall_keyspace(
@@ -385,10 +394,17 @@ impl BlockchainDatabase {
     }
 
     /// Returns Fjall and Tapes read transactions at the same main-chain tip.
+    ///
+    /// A write commits the tapes before fjall, so a reader that lands between the 2 commits gets a mismatched pair.
+    /// Retrying gives the writer the time it needs to finish.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if the tips still disagree after `TIPS_MATCH_RETRIES` retries.
     pub fn read_transactions(
         &self,
     ) -> Result<(fjall::Snapshot, TapesReadTransaction), BlockchainError> {
-        loop {
+        for _ in 0..TIPS_MATCH_RETRIES {
             let fjall = self.fjall.snapshot();
             let tapes = self.linear_tapes.reader();
 
@@ -396,8 +412,12 @@ impl BlockchainDatabase {
                 return Ok((fjall, tapes));
             }
 
-            // TODO: bound this and panic if we can't get the txs to agree.
+            std::thread::sleep(TIPS_MATCH_RETRY_DELAY);
         }
+
+        // Fjall and the tapes disagree *and* nothing is closing the gap, so give up
+        // Restarting rebuilds fjall from the tapes, spinning here forever would just hang every reader instead
+        panic!("fjall and the tapes did not agree on a main-chain tip after {TIPS_MATCH_RETRIES} retries, a write failed part way through, restart to rebuild fjall from the tapes");
     }
 
     /// Checks if the fjall and tapes database are in sync and rebuilds the fjall database if it
